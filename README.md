@@ -72,6 +72,8 @@ The check reads every session token in the request, not only the session cookie,
 - **`multiSession()`** keeps a `<session cookie>_multi-<token>` cookie per signed-in account. A copied one is dropped like the session cookie, so it can't list, switch to, or revoke the owner's session. In a DBSC browser only one session at a time has a live bound cookie, so switching back to another bound account there means signing in to it again, and sign-out revokes only the sessions the request proves. The others expire as usual.
 - **`admin()`** keeps the admin's own session token in an `admin_session` cookie while they impersonate someone, and `/admin/stop-impersonating` swaps it back in. A copied one naming a bound session without its live bound cookie is dropped too, so it can't hand the admin's session or profile to whoever holds a copy of the impersonation session.
 
+With enforcement enabled, a server-side session lookup that finds no live session takes precedence over Better Auth's session cookie cache. DBSC status and fresh-proof helpers accept bearer authentication through Better Auth's installed bearer plugin and honor its signature policy.
+
 Helpers that read cookies without calling Better Auth are outside this check. `getCookieCache()` decodes the `session.cookieCache` cookie on its own, so in middleware it answers a copied pair of cookies with the owner's session; `getSessionCookie()` only says a cookie is there. Treat both as hints for redirects, and authorize with `auth.api.getSession({ headers })`. The same goes for a third-party plugin that carries a session token somewhere this list doesn't name.
 
 ## Schema

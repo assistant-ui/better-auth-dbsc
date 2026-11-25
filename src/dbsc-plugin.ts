@@ -491,7 +491,8 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
 
   /** Reads the session the request carries and whether it is proven. No writes. */
   async function sessionState(ctx: HookContext): Promise<SessionState> {
-    return stateFor(ctx, (await readSessionToken(ctx)) ?? readBearerToken(ctx));
+    // The bearer plugin supplies a signed session cookie when it accepts the request.
+    return stateFor(ctx, await readSessionToken(ctx));
   }
 
   /**
@@ -539,6 +540,7 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
    */
   async function gate(ctx: HookContext): Promise<{
     drop: Set<string>;
+    disableCookieCache: boolean;
     sessions: Exclude<SessionState, { kind: "none" | "unproven" }>[];
   }> {
     const sessionCookie = ctx.context.authCookies.sessionToken.name;
@@ -600,7 +602,17 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
       (state): state is Exclude<SessionState, { kind: "none" | "unproven" }> =>
         state.kind === "plain" || state.kind === "bound",
     );
-    return { drop, sessions: sessions.filter((state, i) => sessions.indexOf(state) === i) };
+    // A downstream session read must honor a server-side miss even if bearer() later
+    // rebuilds the Cookie header from the original request.
+    const disableCookieCache =
+      ctx.context.options.session?.cookieCache?.enabled === true &&
+      ((cookieToken !== null && cookieState.kind === "none") ||
+        (bearerToken !== null && bearerState.kind === "none"));
+    return {
+      drop,
+      disableCookieCache,
+      sessions: sessions.filter((state, i) => sessions.indexOf(state) === i),
+    };
   }
 
   /**
@@ -1120,12 +1132,19 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
           matcher: (ctx) => enforced(ctx.path),
           handler: createAuthMiddleware(async (ctx) => {
             if (!(await config.enabled())) return;
-            const { drop, sessions } = await gate(ctx);
+            const { drop, sessions, disableCookieCache } = await gate(ctx);
             // As if those cookies were absent: the endpoint answers as signed out, and
             // nothing it does can touch the owner's session.
             const result =
-              drop.size > 0
-                ? { context: { headers: withoutCookies(ctx.headers, drop) } }
+              drop.size > 0 || disableCookieCache
+                ? {
+                    context: {
+                      ...(drop.size > 0 && { headers: withoutCookies(ctx.headers, drop) }),
+                      ...(disableCookieCache && {
+                        query: { ...ctx.query, disableCookieCache: true },
+                      }),
+                    },
+                  }
                 : undefined;
             const policy = ctx.path ? config.freshProof.paths.get(ctx.path) : undefined;
             if (!policy) return result;
