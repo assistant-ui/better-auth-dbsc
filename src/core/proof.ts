@@ -92,7 +92,10 @@ export async function verifyRefreshProof(
   input: VerifyRefreshProofInput,
 ): Promise<VerifyRefreshProofResult> {
   const header = readHeader(jwt);
-  readAlgorithm(header.alg, [input.publicKey.alg]);
+  const algorithm = readAlgorithm(input.publicKey?.alg, DBSC_ALGORITHMS);
+  readAlgorithm(header.alg, [algorithm]);
+  // Storage is a runtime boundary. Retain any JWK usage restrictions for the verifier.
+  toPublicKey(input.publicKey, algorithm);
   // A refresh proof must not introduce a key; any embedded key is ignored and the
   // signature is checked against the bound key only.
   const claims = await verifySignature(jwt, input.publicKey);
