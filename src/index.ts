@@ -7,6 +7,7 @@ export {
   resolveDbscOptions,
 } from "./dbsc-plugin.ts";
 export type {
+  DbscCarrier,
   DbscFreshProofRule,
   DbscEvent,
   DbscOptions,

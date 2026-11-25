@@ -27,7 +27,7 @@ Then add the `dbscSession` table (see [Schema](#schema)).
 
 - It does not protect sessions in browsers without DBSC. They work exactly as before, unless you refuse them on chosen paths with [`freshProof`](#freshproof-sensitive-actions).
 - It does not stop malware running on the user's machine right now, because that malware can ask the TPM to sign. It stops cookies from being stolen and used somewhere else later.
-- It does not work for bearer-token clients. A bound session is refused over `Authorization: Bearer` because a bearer client can't renew the bound cookie. Unbound sessions keep working over bearer.
+- It does not work for bearer-token clients. A bearer client can't renew the bound cookie, so a bound session is refused over `Authorization: Bearer` unless the same request also carries that session's live bound cookie. Unbound sessions keep working over bearer. See [Other ways a session arrives](#other-ways-a-session-arrives).
 - It has not been tested against real Chrome. See [Limits](#limits).
 
 The threats it covers, and the ones it doesn't, are mapped in [docs/threat-model.md](docs/threat-model.md).
@@ -58,11 +58,21 @@ Every request then goes through one check:
 |---|---|---|
 | Not bound | any | Allowed. This is every browser without DBSC. |
 | Bound | live, and minted for this session | Allowed. |
-| Bound | missing, expired, or for another session | The session cookie is dropped from the request, so every endpoint sees a signed-out user and `getSession` returns `null`. Over bearer: `401 DBSC_CREDENTIAL_REQUIRED`. |
+| Bound | missing, expired, or for another session | The session cookie is dropped from the request, so every endpoint sees a signed-out user and `getSession` returns `null`. With `Authorization: Bearer`: `401 DBSC_CREDENTIAL_REQUIRED`. |
 
 Dropping the cookie, rather than revoking the session, means someone holding a copied cookie can't sign the owner out. Sign-in and sign-up still work for that request, so a user whose key is gone signs in again and gets a new session.
 
 The check runs on every Better Auth endpoint and on `auth.api.*` calls from your own routes, such as `auth.api.getSession({ headers })`.
+
+### Other ways a session arrives
+
+The check reads every session token in the request, not only the session cookie, because plugins can hand an endpoint a different one:
+
+- **`bearer()`** turns `Authorization: Bearer <token>` into the session cookie in its own hook. That hook may run after this one and rebuilds the cookie header from the original request, so dropping a cookie can't be relied on. The rule is: a request with `Authorization: Bearer` that carries any bound session, through the cookie, the bearer token, a `multiSession()` cookie or `admin_session`, gets `401 DBSC_CREDENTIAL_REQUIRED` unless the bound cookie proves every bound session in it and the session cookie and the bearer token name that one session (or no session). So the bound browser can still send its own session as a bearer token, a bearer token that isn't a session token (an OAuth access token) is left alone, and plain sessions over bearer work as before. A stolen token is refused however it is sent: as a bearer token, next to the copied cookie, or next to the thief's own session cookie.
+- **`multiSession()`** keeps a `<session cookie>_multi-<token>` cookie per signed-in account. A copied one is dropped like the session cookie, so it can't list, switch to, or revoke the owner's session. In a DBSC browser only one session at a time has a live bound cookie, so switching back to another bound account there means signing in to it again, and sign-out revokes only the sessions the request proves. The others expire as usual.
+- **`admin()`** keeps the admin's own session token in an `admin_session` cookie while they impersonate someone, and `/admin/stop-impersonating` swaps it back in. A copied one naming a bound session without its live bound cookie is dropped too, so it can't hand the admin's session or profile to whoever holds a copy of the impersonation session.
+
+Helpers that read cookies without calling Better Auth are outside this check. `getCookieCache()` decodes the `session.cookieCache` cookie on its own, so in middleware it answers a copied pair of cookies with the owner's session; `getSessionCookie()` only says a cookie is there. Treat both as hints for redirects, and authorize with `auth.api.getSession({ headers })`. The same goes for a third-party plugin that carries a session token somewhere this list doesn't name.
 
 ## Schema
 
@@ -231,7 +241,7 @@ dbsc({
 | `refreshed` | A bound cookie was renewed. |
 | `refresh_challenged` | With a `reason`: `missing_proof` (normal), `stale_challenge`, or `replayed`. |
 | `proof_rejected` | A refresh carried a proof the bound key didn't sign. This is the strongest theft signal. The binding is untouched, so revoke the session here if you'd rather sign the owner out. |
-| `credential_missing` | A bound session arrived without its cookie, `via` `cookie` or `bearer`. One now and then is normal. A burst means a copied cookie. |
+| `credential_missing` | A bound session arrived without its bound cookie, `via` `cookie`, `bearer`, `multi-session` or `admin-session`. Once per session per request. One now and then is normal. A burst means a copied cookie. |
 | `fresh_proof_challenged`, `fresh_proof_answered` | The `freshProof` round trip, with the `action`. |
 | `unbound_refused` | A plain session was refused on a `freshProof` path, with the `policy`. |
 | `terminated` | The browser was told to end its DBSC session: `disabled`, `no_session`, `not_bound`, or `other_identifier`. |
@@ -255,7 +265,7 @@ The three HTTP endpoints carry OpenAPI metadata, so Better Auth's `openAPI()` pl
 
 | Code | Status | When |
 |---|---|---|
-| `DBSC_CREDENTIAL_REQUIRED` | 401 | A bound session was sent as a bearer token. |
+| `DBSC_CREDENTIAL_REQUIRED` | 401 | A request with `Authorization: Bearer` carried a bound session without its live bound cookie, or alongside another session. |
 | `DBSC_FRESH_PROOF_REQUIRED` | 403 | A `freshProof` path needs a proof the browser hasn't made yet. |
 | `DBSC_BINDING_REQUIRED` | 403 | A `freshProof` path with `unbound: "deny"` got a plain session. |
 | `SESSION_NOT_FRESH` | 403 | Better Auth's own code, for `unbound: "fresh-session"`. |
@@ -332,13 +342,15 @@ CI runs lint, format, typecheck, tests, the build and a check of the packed tarb
 pnpm release     # bumpp: commits "chore: release vX.Y.Z", tags vX.Y.Z, pushes
 ```
 
-The tag runs the release workflow, which checks the tag against `package.json`, runs every check again, publishes to npm with provenance through trusted publishing (no npm token), and creates the GitHub release. A prerelease such as `0.2.0-beta.1` publishes under the `next` dist-tag.
+The tag runs the release workflow in the `npm-publish` environment, which waits for a required reviewer to approve and accepts only `v*` tags. It checks the tag against `package.json`, runs every check again, publishes to npm with provenance through trusted publishing (no npm token), and creates the GitHub release. A version already on npm (such as a first release published by hand) skips the publish and still gets its GitHub release. A prerelease such as `0.2.0-beta.1` publishes under the `next` dist-tag.
+
+npm's trusted publisher must name the environment: `npm trust github @assistant-ui/better-auth-dbsc --repo assistant-ui/better-auth-dbsc --file release.yml --env npm-publish --allow-publish`.
 
 ## Limits
 
 - **Not tested against real Chrome.** The wire format follows the W3C Editor's Draft (November 2026). Because Chrome builds have differed, the proof parser also accepts the key in the payload (`jwk` or `key`) and a string `iat`. Try it on Chrome 146+ on Windows before relying on it.
 - **Paths outside `freshProof` stay exposed for up to `boundCookieMaxAge`.** Someone who copies both cookies can use them until the bound cookie expires.
 - **DBSC requests skip Better Auth's origin check.** The browser's registration and refresh requests aren't guaranteed to carry `Origin`. On those two endpoints the CSRF defense is the signed proof over a server challenge, and refresh also requires the `Sec-Secure-Session-Id` header, which a page can't send cross-site without a preflight.
-- **One store read per request for sessions with a token.** The gate reads the session and its binding to know whether a bound cookie is required.
+- **Two database reads per request for each session token it carries.** The gate reads the session and its binding (`findSession`, then the `dbscSession` row) to know whether a bound cookie is required. This happens on every Better Auth call, `getSession` included, even with `session.cookieCache` on. Each `multiSession()` or `admin_session` cookie adds two more.
 - **The `authorization` registration parameter isn't sent.** `verifyRegistrationProof` checks it when you pass one.
 - **Only the SQLite migration is checked in.** Postgres and MySQL come from the Better Auth CLI and haven't been tested here.
