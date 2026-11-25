@@ -5,11 +5,13 @@ import { describe, expect, it } from "vitest";
 import packageJson from "../package.json" with { type: "json" };
 import { dbscClient } from "../src/client.ts";
 import {
+  createAdapterDbscStore,
   createMemoryDbscStore,
   dbsc,
   DBSC_ERROR_CODES,
   resolveDbscOptions,
   type DbscOptions,
+  type DbscStoreAdapter,
 } from "../src/index.ts";
 import {
   BOUND_COOKIE,
@@ -185,6 +187,39 @@ describe("registration", () => {
     expect((await browser.register(await device.registrationProof(refreshChallenge))).status).toBe(
       400,
     );
+  });
+
+  it("emits one registration event when two requests bind the same key concurrently", async () => {
+    const events: string[] = [];
+    let bindAttempts = 0;
+    let release!: () => void;
+    const bothReady = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { auth, database } = await createTestAuth({
+      onEvent: (event) => void events.push(event.type),
+      store: (ctx) => {
+        const store = createAdapterDbscStore(ctx.adapter as unknown as DbscStoreAdapter);
+        return {
+          ...store,
+          async bind(binding) {
+            if (++bindAttempts === 2) release();
+            await bothReady;
+            return store.bind(binding);
+          },
+        };
+      },
+    });
+    const browser = new Browser(auth);
+    const registration = await browser.signUp();
+    const device = await Device.create();
+    const proof = await device.registrationProof(
+      challengeFrom(registration.headers.get("secure-session-registration")),
+    );
+    const responses = await Promise.all([browser.register(proof), browser.register(proof)]);
+    expect(responses.map((response) => response.status)).toEqual([200, 200]);
+    expect(database.prepare("SELECT COUNT(*) AS count FROM dbscSession").get()?.count).toBe(1);
+    expect(events.filter((type) => type === "registered")).toHaveLength(1);
   });
 
   it("answers a repeated registration from the same key, and refuses another key", async () => {

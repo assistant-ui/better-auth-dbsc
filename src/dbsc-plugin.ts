@@ -891,18 +891,22 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
           const store = storeFor(ctx.context);
           const { session } = found;
           const existing = await store.find(session.id);
-          const bound = existing
-            ? existing.thumbprint === verified.thumbprint
-            : (await store.bind({
-                sessionId: session.id,
-                userId: session.userId,
-                publicKey: verified.publicKey,
-                thumbprint: verified.thumbprint,
-              })) || (await store.find(session.id))?.thumbprint === verified.thumbprint;
-          if (!bound) {
-            throw await refused("bound_to_other_key", DBSC_ERROR_CODES.DBSC_BOUND_TO_OTHER_KEY);
+          const created =
+            !existing &&
+            (await store.bind({
+              sessionId: session.id,
+              userId: session.userId,
+              publicKey: verified.publicKey,
+              thumbprint: verified.thumbprint,
+            }));
+          if (created) {
+            await emit(ctx, { type: "registered", ...ids(session) });
+          } else {
+            const binding = existing ?? (await store.find(session.id));
+            if (binding?.thumbprint !== verified.thumbprint) {
+              throw await refused("bound_to_other_key", DBSC_ERROR_CODES.DBSC_BOUND_TO_OTHER_KEY);
+            }
           }
-          if (!existing) await emit(ctx, { type: "registered", ...ids(session) });
 
           // The cookie lives from the challenge, not from now: a replayed registration
           // proof gets the same answer again, never more time. It answers no fresh proof.
