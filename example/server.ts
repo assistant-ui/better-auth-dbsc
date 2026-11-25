@@ -4,6 +4,8 @@ import { auth } from "./auth.ts";
 
 const authHandler = toNodeHandler(auth);
 const port = Number(process.env.PORT ?? 3000);
+// Loopback only, unless you ask for more: this is a demo, not a deployment.
+const host = process.env.HOST ?? "127.0.0.1";
 
 const page = `<!doctype html>
 <meta charset="utf-8">
@@ -35,7 +37,7 @@ const page = `<!doctype html>
   });
 </script>`;
 
-createServer(async (req, res) => {
+export const server = createServer(async (req, res) => {
   if (req.url?.startsWith("/api/auth/")) return authHandler(req, res);
   if (req.url === "/me") {
     // App routes go through auth.api, so DBSC enforcement applies here too.
@@ -47,4 +49,4 @@ createServer(async (req, res) => {
   }
   res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
   res.end(page);
-}).listen(port, () => console.log(`http://localhost:${port}`));
+}).listen(port, host, () => console.log(`http://localhost:${port}`));

@@ -30,6 +30,13 @@ export interface DbscStore {
    * two requests carrying the same proof, at most one gets `true`.
    */
   spend(sessionId: string, kind: DbscProofKind, issuedAtMs: number): Promise<boolean>;
+  /**
+   * Removes the binding and anything spent for it. Called whenever Better Auth deletes the
+   * session: sign-out, revocation, a deleted user, or an expired session it comes across.
+   * Better Auth leaves sessions that expire unseen in place, so prune bindings whose
+   * session is gone the same way you prune sessions.
+   */
+  delete(sessionId: string): Promise<void>;
 }
 
 export const DBSC_MODEL = "dbscSession";
@@ -79,6 +86,7 @@ export interface DbscStoreAdapter {
     where: { field: string; value: unknown }[];
   }): Promise<T | null>;
   create<T>(data: { model: string; data: Record<string, unknown> }): Promise<T>;
+  delete(data: { model: string; where: { field: string; value: unknown }[] }): Promise<void>;
   incrementOne<T>(data: {
     model: string;
     where: { field: string; value: unknown; operator?: "lt" | "eq" }[];
@@ -150,6 +158,14 @@ export function createAdapterDbscStore(adapter: DbscStoreAdapter): DbscStore {
       });
       return row !== null;
     },
+
+    async delete(sessionId) {
+      // The foreign key usually removed the row with its session already.
+      await adapter.delete({
+        model: DBSC_MODEL,
+        where: [{ field: "sessionId", value: sessionId }],
+      });
+    },
   };
 }
 
@@ -173,6 +189,10 @@ export function createMemoryDbscStore(): DbscStore & { bindings: Map<string, Dbs
       if ((spent.get(key) ?? -1) >= issuedAtMs) return false;
       spent.set(key, issuedAtMs);
       return true;
+    },
+    async delete(sessionId) {
+      bindings.delete(sessionId);
+      for (const kind of ["refresh", "fresh-proof"]) spent.delete(`${kind}:${sessionId}`);
     },
   };
 }

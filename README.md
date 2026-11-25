@@ -151,7 +151,7 @@ BetterAuthError: Invalid dbsc() options:
 | `scope.exclude` | Path prefixes the browser never holds for a refresh, such as `/assets/`. The DBSC endpoints are always excluded. |
 | `scope.rules` | Raw `scope_specification` entries, sent after `exclude`, for anything `exclude` can't express. |
 | `enforcement.enabled` | `true` drops the cookie of a bound session that has no live bound cookie. `false` binds sessions but never drops or refuses anything. That's how to roll this out: watch `onEvent`, then turn it on. |
-| `enforcement.exclude` | Paths left alone, such as `["/health/"]`. A trailing `/` matches child paths. |
+| `enforcement.exclude` | Paths left alone, such as `["/health/"]`. A trailing `/` matches child paths. A `freshProof` path can't be excluded: `dbsc()` refuses to start rather than skip its proof. |
 | `freshProof` | Paths that need a proof made after the request arrived. See [freshProof](#freshproof-sensitive-actions). |
 | `rateLimit` | Per-address limit on `/dbsc/register` and `/dbsc/refresh`, through Better Auth's own limiter, which is on in production by default. Set it generously, because an office shares one address. |
 | `onEvent` | Receives registrations, refreshes, refusals, and theft signals. See [Events](#events). |
@@ -181,7 +181,7 @@ dbsc({
 });
 ```
 
-On a bound session, the first attempt is refused with `403 DBSC_FRESH_PROOF_REQUIRED` and its bound cookie removed. The browser refreshes with its key, and the retry passes once. A copied cookie can't answer, however fresh it is.
+On a bound session, the first attempt is refused with `403 DBSC_FRESH_PROOF_REQUIRED` and its bound cookie removed. The browser refreshes with its key, and the retry passes once. A copied cookie can't answer, however fresh it is: the refresh writes the challenge's nonce into the new bound cookie, and only a cookie that names the challenge answers it. No clocks are compared, so instances whose clocks differ can't make an old cookie look newer.
 
 A navigation (`Sec-Fetch-Mode: navigate`), such as a link to `/oauth2/authorize` or a form post, gets `307` back to the same URL instead, because the browser would show a JSON 403 to the user. The browser holds the redirected request, refreshes with its key, and follows it. A `307` keeps a form post's method and body.
 
@@ -281,8 +281,11 @@ interface DbscStore {
   find(sessionId: string): Promise<DbscBinding | null>;
   bind(binding: DbscBinding): Promise<boolean>; // false if the session was already bound
   spend(sessionId: string, kind: "refresh" | "fresh-proof", issuedAtMs: number): Promise<boolean>;
+  delete(sessionId: string): Promise<void>; // the session ended: drop the binding and its spend state
 }
 ```
+
+`delete` runs whenever Better Auth deletes a session: sign-out, `revoke-session(s)`, a deleted user, or an expired session it comes across. Better Auth leaves sessions that expire unseen in place, so prune bindings whose session is gone the way you prune sessions. Don't expire a binding on a fixed TTL: sessions roll forward, and a binding that lapses before its session turns it back into a plain session. If sessions live only in `secondaryStorage`, Better Auth runs no delete hooks, so pruning is all there is.
 
 `bind` and `spend` must be atomic. Of two racing registrations, at most one binds, and of two requests carrying the same proof, at most one spends. `spend` also refuses a challenge older than the newest one spent. The default store does this with one guarded `incrementOne`. `createMemoryDbscStore()` is there for tests and single-instance development.
 
@@ -314,6 +317,9 @@ import {
   readDbscChallenge,
   createBoundToken,
   readBoundToken,
+  createFreshProofToken,
+  readFreshProofToken,
+  readFreshProofNonce,
 } from "@assistant-ui/better-auth-dbsc/core";
 
 const { publicKey, thumbprint } = await verifyRegistrationProof(jwt, {
@@ -332,6 +338,7 @@ You don't need Chrome to exercise the cryptography. The tests play the browser w
 pnpm install
 pnpm test        # registration, refresh, replay races, enforcement, freshProof, events, threat model
 pnpm example     # http://localhost:3000: a sign-up form and a protected /me route
+                 # listens on 127.0.0.1 (HOST to change); random secret per run unless BETTER_AUTH_SECRET
 ```
 
 CI runs lint, format, typecheck, tests, the build and a check of the packed tarball on Node 22 and 24, plus the tests against Better Auth 1.7.0, the oldest release `peerDependencies` admits.
