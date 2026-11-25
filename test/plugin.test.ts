@@ -1,6 +1,6 @@
 import type { BetterAuthPlugin } from "better-auth";
 import { createAuthEndpoint, dispatchAuthEndpoint, sessionMiddleware } from "better-auth/api";
-import { bearer, multiSession, openAPI } from "better-auth/plugins";
+import { admin, bearer, jwt, multiSession, openAPI } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import packageJson from "../package.json" with { type: "json" };
 import { dbscClient } from "../src/client.ts";
@@ -449,6 +449,18 @@ describe("enforcement", () => {
     ).toBeNull();
   });
 
+  it("does not answer from session.cookieCache for a copied cookie", async () => {
+    const { auth } = await createTestAuth(
+      {},
+      { session: { cookieCache: { enabled: true, maxAge: 300 } } },
+    );
+    const { browser } = await signUpAndBind(auth);
+    expect(await browser.getSession()).not.toBeNull();
+    expect([...browser.cookies.keys()].some((name) => name.endsWith("session_data"))).toBe(true);
+    browser.cookies.delete(BOUND_COOKIE);
+    expect(await browser.getSession()).toBeNull();
+  });
+
   it("refuses a bound session sent as a bearer token", async () => {
     const { auth } = await createTestAuth({}, { plugins: [bearer()] });
     const { browser } = await signUpAndBind(auth);
@@ -628,6 +640,70 @@ for (const dbscLast of [false, true]) {
       expect(((await list.json()) as unknown[]).length).toBe(1);
       const sessionToken = tokenOf(browser).split(".")[0]!;
       expect((await browser.post("/multi-session/set-active", { sessionToken })).status).toBe(200);
+    });
+
+    /** A bound admin impersonating a plain user: the jar holds both sessions. */
+    const impersonating = async (pluginOptions: DbscOptions = {}) => {
+      const { auth, database } = await createTestAuth(
+        pluginOptions,
+        { plugins: [admin()] },
+        { dbscLast },
+      );
+      const { browser: adminBrowser } = await signUpAndBind(auth);
+      const adminSession = await adminBrowser.getSession();
+      database
+        .prepare('update "user" set "role" = ? where "id" = ?')
+        .run("admin", adminSession!.user.id as string);
+      const target = new Browser(auth);
+      await target.signUp();
+      const userId = (await target.getSession())!.user.id;
+      const response = await adminBrowser.post("/admin/impersonate-user", { userId });
+      expect(response.status).toBe(200);
+      return { auth, adminBrowser, adminSession: adminSession! };
+    };
+
+    it("does not leak a bound admin session through a copied admin_session cookie", async () => {
+      const events: Record<string, unknown>[] = [];
+      const { auth, adminBrowser, adminSession } = await impersonating({
+        onEvent: (event) => void events.push(event),
+      });
+      const thief = new Browser(auth);
+      for (const [name, value] of adminBrowser.cookies) {
+        if (name === SESSION_COOKIE || name.endsWith("admin_session"))
+          thief.cookies.set(name, value);
+      }
+
+      const stop = await thief.post("/admin/stop-impersonating", {});
+      expect(stop.status).not.toBe(200);
+      expect(await stop.text()).not.toContain(adminSession.user.email);
+      // The copied impersonation session is plain: the thief is the target user, not the admin.
+      expect((await thief.getSession())?.user.id).not.toBe(adminSession.user.id);
+      expect(events).toContainEqual({
+        type: "credential_missing",
+        sessionId: adminSession.session.id,
+        userId: adminSession.user.id,
+        via: "admin-session",
+      });
+    });
+
+    it("lets the bound admin stop impersonating", async () => {
+      const { adminBrowser, adminSession } = await impersonating();
+      const stop = await adminBrowser.post("/admin/stop-impersonating", {});
+      expect(stop.status).toBe(200);
+      expect((await stop.json()).user.id).toBe(adminSession.user.id);
+      expect((await adminBrowser.getSession())?.session.id).toBe(adminSession.session.id);
+    });
+
+    it("does not mint a jwt() token from a copied cookie", async () => {
+      const { auth } = await createTestAuth({}, { plugins: [jwt()] }, { dbscLast });
+      const { browser: owner } = await signUpAndBind(auth);
+      expect((await owner.fetch("/token")).status).toBe(200);
+      const thief = new Browser(auth);
+      thief.cookies.set(SESSION_COOKIE, owner.cookies.get(SESSION_COOKIE)!);
+      expect((await thief.fetch("/token")).status).toBe(401);
+      const session = await thief.fetch("/get-session");
+      expect(session.headers.get("set-auth-jwt")).toBeNull();
+      expect(await session.json()).toBeNull();
     });
   });
 }
