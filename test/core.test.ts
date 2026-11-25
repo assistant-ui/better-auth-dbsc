@@ -12,6 +12,7 @@ import {
   parseStoredPublicKey,
   readBoundToken,
   readDbscChallenge,
+  readFreshProofNonce,
   readFreshProofToken,
   verifyRefreshProof,
   verifyRegistrationProof,
@@ -307,25 +308,40 @@ describe("signed values", () => {
   });
 
   it("reads a bound cookie only for its session and before expiry", async () => {
+    const challenge = await createFreshProofToken({
+      secret,
+      sessionToken: "t1",
+      action: "/change-email",
+      nowMs: now,
+    });
+    const answers = readFreshProofNonce(challenge)!;
+    expect(answers).toBe(challenge.split(".")[1]);
     const token = await createBoundToken({
       secret,
       sessionToken: "t1",
       expiresAtMs: now + 60_000,
-      issuedAtMs: now,
+      answers,
     });
     expect(await readBoundToken({ secret, sessionToken: "t1", token, nowMs: now })).toEqual({
       expiresAtMs: now + 60_000,
-      issuedAtMs: now,
+      answers,
+    });
+    const plain = await createBoundToken({ secret, sessionToken: "t1", expiresAtMs: now + 60_000 });
+    expect(plain).toMatch(/^\d+\.-\.[\w-]{22}\.[\w-]{43}$/);
+    expect(await readBoundToken({ secret, sessionToken: "t1", token: plain, nowMs: now })).toEqual({
+      expiresAtMs: now + 60_000,
+      answers: null,
     });
     expect(await readBoundToken({ secret, sessionToken: "t2", token, nowMs: now })).toBeNull();
     expect(
       await readBoundToken({ secret, sessionToken: "t1", token, nowMs: now + 60_000 }),
     ).toBeNull();
-    // Pushing the expiry or the issue time out breaks the MAC.
-    const [expires, issued, nonce, mac] = token.split(".");
+    // Pushing the expiry out or naming another challenge breaks the MAC.
+    const [expires, , nonce, mac] = token.split(".");
     for (const forged of [
-      `${Number(expires) + 86_400}.${issued}.${nonce}.${mac}`,
-      `${expires}.${now + 1}.${nonce}.${mac}`,
+      `${Number(expires) + 86_400}.${answers}.${nonce}.${mac}`,
+      `${expires}.-.${nonce}.${mac}`,
+      `${expires}.${"A".repeat(22)}.${nonce}.${mac}`,
     ]) {
       expect(
         await readBoundToken({ secret, sessionToken: "t1", token: forged, nowMs: now }),
@@ -355,10 +371,11 @@ describe("signed values", () => {
         ttlSeconds: 60,
         ...input,
       });
-    expect(await read({})).toEqual({ issuedAtMs: now });
+    expect(await read({})).toEqual({ issuedAtMs: now, nonce: token.split(".")[1] });
     expect(await read({ action: "/delete-user" })).toBeNull();
     expect(await read({ nowMs: now + 61_000 })).toBeNull();
     expect(await read({ nowMs: now - 1 })).toBeNull();
+    for (const junk of [null, "", "a.b", "1.-.c"]) expect(readFreshProofNonce(junk)).toBeNull();
   });
 });
 

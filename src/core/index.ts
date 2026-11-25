@@ -43,6 +43,7 @@ export {
   createFreshProofToken,
   readBoundToken,
   readDbscChallenge,
+  readFreshProofNonce,
   readFreshProofToken,
 } from "./token.ts";
 export type {

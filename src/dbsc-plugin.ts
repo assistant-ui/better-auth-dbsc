@@ -30,6 +30,7 @@ import {
   createFreshProofToken,
   readBoundToken,
   readDbscChallenge,
+  readFreshProofNonce,
   readFreshProofToken,
 } from "./core/token.ts";
 import {
@@ -338,6 +339,16 @@ export function resolveDbscOptions(options: DbscOptions = {}): ResolvedDbscOptio
   ) {
     issues.push('`freshProof.unbound` must be "allow", "fresh-session", or "deny".');
   }
+  // An excluded path skips the whole gate, fresh proof included, so the weaker option
+  // would win without a word. Refuse to guess.
+  for (const [path] of freshProofEntries) {
+    const excludes = enforcementExclude.filter((entry) => typeof entry === "string");
+    if (typeof path === "string" && isExcluded(path, excludes)) {
+      issues.push(
+        `\`freshProof.paths\` entry \`${path}\` is excluded by \`enforcement.exclude\`, which would skip its fresh proof. Remove it from one of them.`,
+      );
+    }
+  }
   const freshProofExpiresIn = options.freshProof?.expiresIn ?? 60;
   positiveInteger(freshProofExpiresIn, "freshProof.expiresIn");
   const rateLimit = {
@@ -400,7 +411,8 @@ type SessionState =
       token: string;
       session: Session;
       binding: DbscBinding;
-      boundIssuedAtMs: number;
+      /** The fresh-proof challenge nonce the bound cookie answers, if any. */
+      answers: string | null;
     }
   | { kind: "unproven"; session: Session };
 
@@ -504,7 +516,7 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
       token,
       session: found.session,
       binding,
-      boundIssuedAtMs: bound.issuedAtMs,
+      answers: bound.answers,
     };
   }
 
@@ -584,9 +596,11 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
   }
 
   /**
-   * A fresh proof for `action`: answered once by a bound cookie issued after this
-   * action's challenge, or a new challenge with the bound cookie removed so the browser
-   * refreshes before the retry.
+   * A fresh proof for `action`: answered once by a bound cookie that a refresh minted
+   * while the browser held this action's challenge, or a new challenge with the bound
+   * cookie removed so the browser refreshes before the retry. The cookie names the
+   * challenge it answers: comparing issue times would trust clocks that differ between
+   * instances, and a copied cookie from a node running ahead would look newer.
    */
   async function checkFreshProof(
     ctx: HookContext,
@@ -604,7 +618,7 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
     });
     if (
       challenge &&
-      state.boundIssuedAtMs > challenge.issuedAtMs &&
+      state.answers === challenge.nonce &&
       (await storeFor(ctx.context).spend(state.session.id, "fresh-proof", challenge.issuedAtMs))
     ) {
       ctx.setCookie(freshProof.name, "", { ...freshProof.attributes, maxAge: 0 });
@@ -659,16 +673,21 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
     };
   }
 
-  async function setBoundCookie(ctx: HookContext, sessionToken: string, issuedAtMs: number) {
+  async function setBoundCookie(
+    ctx: HookContext,
+    sessionToken: string,
+    { expiresAtMs, answers = null }: { expiresAtMs: number; answers?: string | null },
+  ) {
     const { bound } = cookies(ctx);
     const value = await createBoundToken({
       secret: ctx.context.secret,
       sessionToken,
-      expiresAtMs: config.now() + config.boundCookieMaxAge * 1000,
-      issuedAtMs,
+      expiresAtMs,
+      answers,
     });
     // The value is a MAC over the session token already, so a plain cookie is enough.
-    ctx.setCookie(bound.name, value, bound.attributes);
+    const maxAge = Math.max(0, Math.ceil((expiresAtMs - config.now()) / 1000));
+    ctx.setCookie(bound.name, value, { ...bound.attributes, maxAge });
   }
 
   async function setRefreshChallenge(ctx: HookContext, sessionToken: string) {
@@ -760,9 +779,25 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
       // On these two endpoints a signed proof over a server challenge is the CSRF
       // defense, and a page on another site cannot set the DBSC request headers.
       const skip = ctx.skipOriginCheck;
-      if (skip === true) return;
       const paths = [DBSC_REGISTER_PATH, DBSC_REFRESH_PATH];
-      return { context: { skipOriginCheck: Array.isArray(skip) ? [...skip, ...paths] : paths } };
+      return {
+        // A binding goes with its session, whichever way Better Auth ends it. The default
+        // table also cascades; a custom store has only this.
+        options: {
+          databaseHooks: {
+            session: {
+              delete: {
+                async after(session: { id: string }) {
+                  await storeFor(ctx).delete(session.id);
+                },
+              },
+            },
+          },
+        },
+        ...(skip === true
+          ? {}
+          : { context: { skipOriginCheck: Array.isArray(skip) ? [...skip, ...paths] : paths } }),
+      };
     },
 
     endpoints: {
@@ -861,9 +896,11 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
           }
           if (!existing) await emit(ctx, { type: "registered", ...ids(session) });
 
-          // The cookie dates from the challenge, not now: a replayed registration proof
-          // then mints only a cookie older than any fresh-proof challenge that followed.
-          await setBoundCookie(ctx, token, challenge.issuedAtMs);
+          // The cookie lives from the challenge, not from now: a replayed registration
+          // proof gets the same answer again, never more time. It answers no fresh proof.
+          await setBoundCookie(ctx, token, {
+            expiresAtMs: challenge.issuedAtMs + config.boundCookieMaxAge * 1000,
+          });
           await setRefreshChallenge(ctx, token);
           return ctx.json(sessionConfig(ctx));
         },
@@ -957,7 +994,12 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
             return askAgain("replayed");
 
           await emit(ctx, { type: "refreshed", ...ids(found.session) });
-          await setBoundCookie(ctx, token, config.now());
+          // The browser holds a fresh-proof challenge while it refreshes for one: this
+          // cookie names it, and only a cookie that names a challenge answers it.
+          await setBoundCookie(ctx, token, {
+            expiresAtMs: config.now() + config.boundCookieMaxAge * 1000,
+            answers: readFreshProofNonce(ctx.getCookie(cookies(ctx).freshProof.name)),
+          });
           await setRefreshChallenge(ctx, token);
           return ctx.json(sessionConfig(ctx));
         },

@@ -26,6 +26,24 @@ import {
 const CHALLENGE = /^\d+\.[\w-]{22}\.[\w-]{43}$/;
 
 describe("registration", () => {
+  it("does not let a replayed registration outlive the first bound cookie", async () => {
+    const { auth, clock } = await createTestAuth();
+    const browser = new Browser(auth);
+    const device = await Device.create();
+    const signUp = await browser.signUp();
+    const proof = await device.registrationProof(
+      challengeFrom(signUp.headers.get("secure-session-registration")),
+    );
+    expect((await browser.register(proof)).status).toBe(200);
+
+    // A lost answer can still be fetched again, but the cookie it gets dates from the
+    // challenge: replays never stretch access past boundCookieMaxAge (300 s).
+    clock.advance(290);
+    expect((await browser.register(proof)).status).toBe(200);
+    clock.advance(20);
+    expect(await browser.getSession()).toBeNull();
+  });
+
   it("offers DBSC on sign-up under both header names", async () => {
     const { auth } = await createTestAuth();
     const response = await new Browser(auth).signUp();
@@ -671,6 +689,20 @@ describe("store", () => {
     expect((await refreshLikeChrome(browser, device)).status).toBe(200);
   });
 
+  it("releases a binding in a custom store when its session ends", async () => {
+    const store = createMemoryDbscStore();
+    const { auth } = await createTestAuth({ store });
+    const signedOut = await signUpAndBind(auth);
+    expect(store.bindings.size).toBe(1);
+    await signedOut.browser.post("/sign-out", {});
+    expect(store.bindings.size).toBe(0);
+
+    const revoked = await signUpAndBind(auth);
+    expect(store.bindings.size).toBe(1);
+    await revoked.browser.post("/revoke-sessions", {});
+    expect(store.bindings.size).toBe(0);
+  });
+
   it("refuses to start when sessions live only in secondary storage", async () => {
     const memory = new Map<string, string>();
     const secondaryStorage = {
@@ -723,6 +755,21 @@ describe("freshProof", () => {
     clock.advance(1);
     await browser.post("/update-user", { name: "x" });
 
+    browser.cookies.set(BOUND_COOKIE, copiedBound);
+    expect((await browser.post("/update-user", { name: "x" })).status).toBe(403);
+  });
+
+  it("is not answered by a copied cookie minted on a server whose clock runs ahead", async () => {
+    const { auth, clock } = await createTestAuth({ freshProof: { paths: ["/update-user"] } });
+    const { browser, device } = await signUpAndBind(auth);
+    // An instance 10 s ahead renews the bound cookie; the next request lands on one that isn't.
+    clock.advance(10);
+    expect((await refreshLikeChrome(browser, device)).status).toBe(200);
+    clock.advance(-10);
+    const copiedBound = browser.cookies.get(BOUND_COOKIE)!;
+    expect((await browser.post("/update-user", { name: "x" })).status).toBe(403);
+
+    // The thief ignores the response that deletes the bound cookie.
     browser.cookies.set(BOUND_COOKIE, copiedBound);
     expect((await browser.post("/update-user", { name: "x" })).status).toBe(403);
   });
@@ -1034,6 +1081,23 @@ describe("options", () => {
         - \`onEvent\` must be a function.
         - \`advanced.sessionIdentifier\` must be non-empty printable ASCII.]
     `);
+  });
+
+  it("refuses a path that needs a fresh proof but is excluded from enforcement", () => {
+    for (const exclude of ["/update-user", "/"]) {
+      expect(() =>
+        resolveDbscOptions({
+          enforcement: { exclude: [exclude] },
+          freshProof: { paths: ["/update-user"] },
+        }),
+      ).toThrow("`freshProof.paths` entry `/update-user` is excluded by `enforcement.exclude`");
+    }
+    expect(() =>
+      resolveDbscOptions({
+        enforcement: { exclude: ["/admin/"] },
+        freshProof: { paths: { "/change-email": {}, "/admin/ban-user": { unbound: "deny" } } },
+      }),
+    ).toThrow("`freshProof.paths` entry `/admin/ban-user` is excluded by `enforcement.exclude`");
   });
 });
 

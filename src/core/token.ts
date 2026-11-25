@@ -8,7 +8,7 @@ const encoder = new TextEncoder();
 
 const DOMAIN = {
   challenge: "dbsc.challenge.v1",
-  bound: "dbsc.bound-cookie.v1",
+  bound: "dbsc.bound-cookie.v2",
   freshProof: "dbsc.fresh-proof.v1",
 } as const;
 
@@ -76,17 +76,24 @@ export interface CreateBoundTokenInput {
   secret: string;
   sessionToken: string;
   expiresAtMs: number;
-  /** When the proof this cookie answers was made. Fresh-proof checks compare against it. */
-  issuedAtMs: number;
+  /**
+   * The nonce of the fresh-proof challenge the browser held when its key signed the
+   * refresh that minted this cookie, if any. Only a cookie that names a challenge answers
+   * it, so whether a cookie came after a challenge never rests on comparing clocks.
+   */
+  answers?: string | null;
 }
 
-/** The bound cookie's value: `<expires s>.<issued ms>.<nonce>.<mac>`. */
+/** No fresh-proof challenge: `-` is never a nonce. */
+const NO_CHALLENGE = "-";
+
+/** The bound cookie's value: `<expires s>.<answered nonce or ->.<nonce>.<mac>`. */
 export async function createBoundToken(input: CreateBoundTokenInput): Promise<string> {
   const expires = String(Math.floor(input.expiresAtMs / 1000));
-  const issued = String(input.issuedAtMs);
+  const answers = input.answers && isNonce(input.answers) ? input.answers : NO_CHALLENGE;
   const nonce = randomId();
-  const mac = await sign(input.secret, DOMAIN.bound, input.sessionToken, nonce, expires, issued);
-  return `${expires}.${issued}.${nonce}.${mac}`;
+  const mac = await sign(input.secret, DOMAIN.bound, input.sessionToken, nonce, expires, answers);
+  return `${expires}.${answers}.${nonce}.${mac}`;
 }
 
 export interface ReadBoundTokenInput {
@@ -96,14 +103,17 @@ export interface ReadBoundTokenInput {
   nowMs: number;
 }
 
-/** The cookie's expiry and issue time, or `null` unless it is live and minted for this session. */
+/**
+ * The cookie's expiry and the fresh-proof challenge it answers, or `null` unless it is
+ * live and minted for this session.
+ */
 export async function readBoundToken(
   input: ReadBoundTokenInput,
-): Promise<{ expiresAtMs: number; issuedAtMs: number } | null> {
+): Promise<{ expiresAtMs: number; answers: string | null } | null> {
   const parts = splitParts(input.token, 4);
   if (!parts) return null;
-  const [expires, issued, nonce, mac] = parts;
-  if (!isDigits(expires) || !isDigits(issued)) return null;
+  const [expires, answers, nonce, mac] = parts;
+  if (!isDigits(expires) || (answers !== NO_CHALLENGE && !isNonce(answers))) return null;
   if (Number(expires) * 1000 <= input.nowMs) return null;
   const valid = await verify(
     input.secret,
@@ -112,9 +122,13 @@ export async function readBoundToken(
     input.sessionToken,
     nonce,
     expires,
-    issued,
+    answers,
   );
-  return valid ? { expiresAtMs: Number(expires) * 1000, issuedAtMs: Number(issued) } : null;
+  if (!valid) return null;
+  return {
+    expiresAtMs: Number(expires) * 1000,
+    answers: answers === NO_CHALLENGE ? null : answers,
+  };
 }
 
 export interface CreateFreshProofTokenInput {
@@ -145,10 +159,13 @@ export interface ReadFreshProofTokenInput extends Omit<CreateFreshProofTokenInpu
   ttlSeconds: number;
 }
 
-/** When the fresh-proof challenge was issued, or `null` unless it is live and for this action. */
+/**
+ * When the fresh-proof challenge was issued and its nonce, or `null` unless it is live and
+ * for this action.
+ */
 export async function readFreshProofToken(
   input: ReadFreshProofTokenInput,
-): Promise<{ issuedAtMs: number } | null> {
+): Promise<{ issuedAtMs: number; nonce: string } | null> {
   const parts = splitParts(input.token, 3);
   if (!parts) return null;
   const [issued, nonce, mac] = parts;
@@ -164,7 +181,17 @@ export async function readFreshProofToken(
     nonce,
     issued,
   );
-  return valid ? { issuedAtMs: Number(issued) } : null;
+  return valid ? { issuedAtMs: Number(issued), nonce } : null;
+}
+
+/**
+ * The nonce in a fresh-proof challenge, unverified, for `createBoundToken`'s `answers`.
+ * A refresh doesn't know the action the challenge is for, so it can't check the MAC; the
+ * answer is checked in full when the bound cookie is compared against the challenge.
+ */
+export function readFreshProofNonce(token: string | null | undefined): string | null {
+  const parts = splitParts(token, 3);
+  return parts && isNonce(parts[1]) ? parts[1] : null;
 }
 
 function splitParts(value: unknown, count: 3): [string, string, string] | null;
@@ -178,6 +205,10 @@ function splitParts(value: unknown, count: number): string[] | null {
 
 function isDigits(value: string): boolean {
   return /^\d{1,16}$/.test(value);
+}
+
+function isNonce(value: string): boolean {
+  return /^[A-Za-z0-9_-]{16,64}$/.test(value);
 }
 
 function randomId(): string {
