@@ -286,7 +286,10 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 function modulusBits(n: string): number {
   try {
-    return base64UrlDecode(n).length * 8;
+    const bytes = base64UrlDecode(n);
+    const first = bytes[0];
+    if (!first) return 0;
+    return (bytes.length - 1) * 8 + 32 - Math.clz32(first);
   } catch {
     return 0;
   }
