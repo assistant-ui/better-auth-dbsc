@@ -259,6 +259,9 @@ function checkClaims(claims: DbscProofClaims, input: BaseVerifyInput): void {
   }
   if (input.expectedOrigin === undefined || claims.aud === undefined) return;
   const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (audiences.length === 0) {
+    throw new DbscError("AUDIENCE_MISMATCH", "A present DBSC `aud` must name an audience.");
+  }
   for (const audience of audiences) {
     if (typeof audience !== "string" || originOf(audience) !== input.expectedOrigin) {
       throw new DbscError(
