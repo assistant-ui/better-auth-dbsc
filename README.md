@@ -1,4 +1,4 @@
-# @farming-labs/better-auth-dbsc
+# @assistant-ui/better-auth-dbsc
 
 **Device Bound Session Credentials for Better Auth: a stolen session cookie stops working on any other machine.**
 
@@ -7,12 +7,12 @@ When a browser with DBSC support signs in, it creates a key in the TPM. Today th
 Browsers without DBSC ignore the registration header and keep using the normal Better Auth session. Nothing changes for them.
 
 ```sh
-pnpm add @farming-labs/better-auth-dbsc
+pnpm add @assistant-ui/better-auth-dbsc
 ```
 
 ```ts
 import { betterAuth } from "better-auth";
-import { dbsc } from "@farming-labs/better-auth-dbsc";
+import { dbsc } from "@assistant-ui/better-auth-dbsc";
 
 export const auth = betterAuth({
   database,
@@ -284,7 +284,7 @@ The browser drives DBSC by itself, so the client needs no code. The client plugi
 
 ```ts
 import { createAuthClient } from "better-auth/react";
-import { dbscClient } from "@farming-labs/better-auth-dbsc/client";
+import { dbscClient } from "@assistant-ui/better-auth-dbsc/client";
 
 export const authClient = createAuthClient({ plugins: [dbscClient()] });
 const { data } = await authClient.dbsc.getStatus(); // { state: "bound" | ... }
@@ -292,7 +292,7 @@ const { data } = await authClient.dbsc.getStatus(); // { state: "bound" | ... }
 
 ## Building blocks
 
-`@farming-labs/better-auth-dbsc/core` exports the protocol pieces without Better Auth, for another framework or your own middleware:
+`@assistant-ui/better-auth-dbsc/core` exports the protocol pieces without Better Auth, for another framework or your own middleware:
 
 ```ts
 import {
@@ -304,7 +304,7 @@ import {
   readDbscChallenge,
   createBoundToken,
   readBoundToken,
-} from "@farming-labs/better-auth-dbsc/core";
+} from "@assistant-ui/better-auth-dbsc/core";
 
 const { publicKey, thumbprint } = await verifyRegistrationProof(jwt, {
   challenge,

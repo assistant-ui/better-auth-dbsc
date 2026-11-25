@@ -1,5 +1,5 @@
 {
-  "name": "@farming-labs/better-auth-dbsc",
+  "name": "@assistant-ui/better-auth-dbsc",
   "version": "0.0.0",
   "description": "Device Bound Session Credentials (DBSC) for Better Auth.",
   "keywords": [
@@ -11,13 +11,13 @@
   ],
   "license": "MIT",
   "author": "KinfeMichael Tariku <kinfishtech@gmail.com> (https://github.com/Kinfe123)",
-  "homepage": "https://github.com/Kinfe123/better-auth-dbsc#readme",
+  "homepage": "https://github.com/assistant-ui/better-auth-dbsc#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Kinfe123/better-auth-dbsc.git"
+    "url": "git+https://github.com/assistant-ui/better-auth-dbsc.git"
   },
   "bugs": {
-    "url": "https://github.com/Kinfe123/better-auth-dbsc/issues"
+    "url": "https://github.com/assistant-ui/better-auth-dbsc/issues"
   },
   "type": "module",
   "sideEffects": false,
