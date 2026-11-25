@@ -164,6 +164,19 @@ describe("verifyRegistrationProof", () => {
     ).toBe("AUTHORIZATION_MISMATCH");
   });
 
+  it("requires a present audience list to name an origin", async () => {
+    const device = await Device.create();
+    const proof = await device.registrationProof("c1", { aud: [] });
+    expect(
+      await codeOf(
+        verifyRegistrationProof(proof, {
+          challenge: "c1",
+          expectedOrigin: "https://app.example",
+        }),
+      ),
+    ).toBe("AUDIENCE_MISMATCH");
+  });
+
   it("checks every audience against the expected origin", async () => {
     const device = await Device.create();
     const ok = await device.registrationProof("c1", {
