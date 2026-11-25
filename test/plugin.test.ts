@@ -779,6 +779,27 @@ describe("store", () => {
     expect(store.bindings.size).toBe(0);
   });
 
+  it("releases a binding in a custom store when its user is deleted", async () => {
+    const store = createMemoryDbscStore();
+    const { auth } = await createTestAuth({ store }, { user: { deleteUser: { enabled: true } } });
+    const { browser } = await signUpAndBind(auth);
+    expect(store.bindings.size).toBe(1);
+    expect((await browser.post("/delete-user", {})).status).toBe(200);
+    expect(store.bindings.size).toBe(0);
+  });
+
+  it("releases a binding in a custom store when Better Auth finds its session expired", async () => {
+    const store = createMemoryDbscStore();
+    const { auth, database } = await createTestAuth({ store });
+    const { browser } = await signUpAndBind(auth);
+    expect(store.bindings.size).toBe(1);
+    database
+      .prepare('update "session" set "expiresAt" = ?')
+      .run(new Date(Date.now() - 1000).toISOString());
+    expect(await browser.getSession()).toBeNull();
+    expect(store.bindings.size).toBe(0);
+  });
+
   it("refuses to start when sessions live only in secondary storage", async () => {
     const memory = new Map<string, string>();
     const secondaryStorage = {
