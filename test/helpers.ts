@@ -22,6 +22,8 @@ export class Clock {
 export async function createTestAuth(
   pluginOptions: DbscOptions = {},
   extra: Partial<BetterAuthOptions> = {},
+  /** Install `dbsc()` after `extra.plugins` instead of before them. */
+  { dbscLast = false }: { dbscLast?: boolean } = {},
 ) {
   const clock = new Clock();
   const database = new DatabaseSync(":memory:");
@@ -35,7 +37,9 @@ export async function createTestAuth(
     advanced: { disableOriginCheck: false },
     logger: { disabled: true },
     ...extra,
-    plugins: [dbsc({ now: clock.now, ...pluginOptions }), ...(extra.plugins ?? [])],
+    plugins: dbscLast
+      ? [...(extra.plugins ?? []), dbsc({ now: clock.now, ...pluginOptions })]
+      : [dbsc({ now: clock.now, ...pluginOptions }), ...(extra.plugins ?? [])],
   } satisfies BetterAuthOptions;
   const { runMigrations } = await getMigrations(options);
   await runMigrations();

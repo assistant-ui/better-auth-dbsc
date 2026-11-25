@@ -95,7 +95,12 @@ export type DbscEvent =
    * A bound session arrived without a live bound cookie and was treated as signed out.
    * Expected now and then from a real browser; a burst of them is a copied cookie.
    */
-  | { type: "credential_missing"; sessionId: string; userId: string; via: "cookie" | "bearer" }
+  | {
+      type: "credential_missing";
+      sessionId: string;
+      userId: string;
+      via: DbscCarrier;
+    }
   | { type: "fresh_proof_challenged"; sessionId: string; userId: string; action: string }
   | { type: "fresh_proof_answered"; sessionId: string; userId: string; action: string }
   | {
@@ -106,6 +111,9 @@ export type DbscEvent =
       policy: DbscUnboundPolicy;
     }
   | { type: "terminated"; reason: "disabled" | "no_session" | "not_bound" | "other_identifier" };
+
+/** Where a request carries a session token: see `dbsc()`'s gate. */
+export type DbscCarrier = "cookie" | "bearer" | "multi-session";
 
 type HookContext = Parameters<Parameters<typeof createAuthMiddleware>[0]>[0];
 type AuthContext = HookContext["context"];
@@ -156,10 +164,11 @@ export interface DbscOptions {
   };
   /**
    * What happens to a bound session that arrives without a live bound cookie: its session
-   * cookie is dropped from the request, as if absent. Every endpoint then behaves as signed
-   * out, `getSession` answers `null`, and the session itself is untouched, so a copied
-   * cookie can never sign the owner out. A bearer token for such a session is refused with
-   * 401.
+   * cookie (and any `multiSession()` cookie naming it) is dropped from the request, as if
+   * absent. Every endpoint then behaves as signed out, `getSession` answers `null`, and the
+   * session itself is untouched, so a copied cookie can never sign the owner out. A request
+   * with `Authorization: Bearer` that carries a bound session is refused with 401 unless
+   * the bound cookie proves it and the bearer token names that same session.
    */
   enforcement?: {
     /**
@@ -393,7 +402,7 @@ type SessionState =
       binding: DbscBinding;
       boundIssuedAtMs: number;
     }
-  | { kind: "unproven"; via: "cookie" | "bearer"; session: Session };
+  | { kind: "unproven"; session: Session };
 
 export type FreshProofState = "off" | "no-session" | "unbound" | "answered" | "challenge";
 export type DbscStatusState = "off" | "no-session" | "unbound" | "bound";
@@ -469,8 +478,14 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
 
   /** Reads the session the request carries and whether it is proven. No writes. */
   async function sessionState(ctx: HookContext): Promise<SessionState> {
-    const cookieToken = await readSessionToken(ctx);
-    const token = cookieToken ?? readBearerToken(ctx.headers);
+    return stateFor(ctx, (await readSessionToken(ctx)) ?? readBearerToken(ctx));
+  }
+
+  /**
+   * Reads one session token's session and whether the bound cookie proves it: two reads,
+   * the session and its binding. No writes.
+   */
+  async function stateFor(ctx: HookContext, token: string | null): Promise<SessionState> {
     if (!token) return { kind: "none" };
     const found = await ctx.context.internalAdapter.findSession(token);
     if (!found || new Date(found.session.expiresAt).getTime() <= config.now())
@@ -483,8 +498,7 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
       token: ctx.getCookie(cookies(ctx).bound.name),
       nowMs: config.now(),
     });
-    if (!bound)
-      return { kind: "unproven", via: cookieToken ? "cookie" : "bearer", session: found.session };
+    if (!bound) return { kind: "unproven", session: found.session };
     return {
       kind: "bound",
       token,
@@ -492,6 +506,81 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
       binding,
       boundIssuedAtMs: bound.issuedAtMs,
     };
+  }
+
+  /**
+   * Checks every session token the request carries, not only the one the endpoint will
+   * read: the session cookie, `Authorization: Bearer` (the `bearer()` plugin turns it into
+   * the session cookie in its own before hook, which may run after this one and rebuilds
+   * the cookie header from the original request), and `multiSession()`'s per-session
+   * cookies. A bound session that the bound cookie does not prove must not reach any
+   * endpoint by any of them.
+   *
+   * - With a bearer token, dropping cookies cannot work, because `bearer()` may write the
+   *   cookie header after this hook. So a request that carries a bound session is refused
+   *   with 401 unless the bound cookie proves every bound session in it and the bearer
+   *   token and the session cookie, where they name a session, name that same one.
+   * - Without one, every cookie naming an unproven bound session is dropped.
+   *
+   * Returns the cookies to drop and the sessions an endpoint may act as.
+   */
+  async function gate(ctx: HookContext): Promise<{
+    drop: Set<string>;
+    sessions: Exclude<SessionState, { kind: "none" | "unproven" }>[];
+  }> {
+    const sessionCookie = ctx.context.authCookies.sessionToken.name;
+    const cookieToken = await readSessionToken(ctx);
+    const bearerToken = readBearerToken(ctx);
+    const carried: { via: DbscCarrier; token: string; cookie?: string }[] = [];
+    if (cookieToken) carried.push({ via: "cookie", token: cookieToken, cookie: sessionCookie });
+    if (bearerToken) carried.push({ via: "bearer", token: bearerToken });
+    for (const name of cookieNames(ctx.headers)) {
+      // `multiSession()` reads every signed cookie whose name contains `_multi-`.
+      if (!name.includes("_multi-")) continue;
+      const token = await ctx.getSignedCookie(name, ctx.context.secret);
+      if (typeof token === "string" && token)
+        carried.push({ via: "multi-session", token, cookie: name });
+    }
+
+    const states = new Map<string, Promise<SessionState>>();
+    const stateOf = (token: string | null) => {
+      if (!token) return Promise.resolve<SessionState>({ kind: "none" });
+      let state = states.get(token);
+      if (!state) states.set(token, (state = stateFor(ctx, token)));
+      return state;
+    };
+    const resolved = await Promise.all(
+      carried.map(async (carrier) => ({ ...carrier, state: await stateOf(carrier.token) })),
+    );
+    const unproven = resolved.filter(({ state }) => state.kind === "unproven");
+    const reported = new Set<string>();
+    for (const { via, token, state } of unproven) {
+      if (reported.has(token) || state.kind !== "unproven") continue;
+      reported.add(token);
+      await emit(ctx, { type: "credential_missing", ...ids(state.session), via });
+    }
+    const cookieState = await stateOf(cookieToken);
+    const bearerState = await stateOf(bearerToken);
+
+    if (bearerToken) {
+      const bound = resolved.some(
+        ({ state }) => state.kind === "bound" || state.kind === "unproven",
+      );
+      if (bound) {
+        // Every bound session here is proven, so all of them are the one the bound cookie names.
+        const proven = (state: SessionState) => state.kind === "none" || state.kind === "bound";
+        if (unproven.length > 0 || !proven(bearerState) || !proven(cookieState)) {
+          throw APIError.from("UNAUTHORIZED", DBSC_ERROR_CODES.DBSC_CREDENTIAL_REQUIRED);
+        }
+      }
+    }
+
+    const drop = new Set(unproven.flatMap(({ cookie }) => (cookie ? [cookie] : [])));
+    const sessions = [cookieState, bearerState].filter(
+      (state): state is Exclude<SessionState, { kind: "none" | "unproven" }> =>
+        state.kind === "plain" || state.kind === "bound",
+    );
+    return { drop, sessions: sessions.filter((state, i) => sessions.indexOf(state) === i) };
   }
 
   /**
@@ -977,32 +1066,24 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
           matcher: (ctx) => enforced(ctx.path),
           handler: createAuthMiddleware(async (ctx) => {
             if (!(await config.enabled())) return;
-            const state = await sessionState(ctx);
-            if (state.kind === "unproven") {
-              await emit(ctx, {
-                type: "credential_missing",
-                ...ids(state.session),
-                via: state.via,
-              });
-              if (state.via === "bearer") {
-                throw APIError.from("UNAUTHORIZED", DBSC_ERROR_CODES.DBSC_CREDENTIAL_REQUIRED);
-              }
-              // As if the session cookie were absent: the endpoint answers as signed out,
-              // and nothing it does can touch the owner's session.
-              return {
-                context: {
-                  headers: withoutCookie(ctx.headers, ctx.context.authCookies.sessionToken.name),
-                },
-              };
-            }
+            const { drop, sessions } = await gate(ctx);
+            // As if those cookies were absent: the endpoint answers as signed out, and
+            // nothing it does can touch the owner's session.
+            const result =
+              drop.size > 0
+                ? { context: { headers: withoutCookies(ctx.headers, drop) } }
+                : undefined;
             const policy = ctx.path ? config.freshProof.paths.get(ctx.path) : undefined;
-            if (policy && state.kind === "plain")
-              await unboundPolicy(ctx, state, ctx.path!, policy);
-            if (policy && state.kind === "bound") {
-              if (ctx.request && answeredRequests.has(ctx.request)) return;
+            if (!policy) return result;
+            for (const state of sessions) {
+              if (state.kind === "plain") await unboundPolicy(ctx, state, ctx.path!, policy);
+            }
+            const state = sessions.find((state) => state.kind === "bound");
+            if (state?.kind === "bound") {
+              if (ctx.request && answeredRequests.has(ctx.request)) return result;
               if ((await checkFreshProof(ctx, state, ctx.path!)) === "answered") {
                 if (ctx.request) answeredRequests.add(ctx.request);
-                return;
+                return result;
               }
               if (ctx.request && ctx.headers?.get("sec-fetch-mode") === "navigate") {
                 // A navigation shows whatever comes back, so a JSON 403 would strand the
@@ -1016,6 +1097,7 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
               const { code, message } = DBSC_ERROR_CODES.DBSC_FRESH_PROOF_REQUIRED;
               throw new APIError("FORBIDDEN", { code, message }, ctx.responseHeaders);
             }
+            return result;
           }),
         },
       ],
@@ -1086,29 +1168,43 @@ async function readSessionToken(ctx: HookContext): Promise<string | null> {
 }
 
 /**
- * The bearer plugin turns `Authorization: Bearer <token>` into a session cookie in its
- * own hook, from the original request. Read it here too, unverified, so a stolen token
- * cannot skip the gate by switching transport. An unverified value can only cause a refusal.
+ * The session token in `Authorization: Bearer`, read the way the `bearer()` plugin reads
+ * it, which turns it into the session cookie in its own hook. Not verified: here it can
+ * only cause a refusal, so a bad signature counts the same as a good one.
  */
-function readBearerToken(headers: Headers | undefined): string | null {
-  const value = headers?.get("authorization");
+function readBearerToken(ctx: HookContext): string | null {
+  const value = ctx.request?.headers.get("authorization") || ctx.headers?.get("authorization");
   if (!value || value.slice(0, 7).toLowerCase() !== "bearer ") return null;
-  let token = value.slice(7).trim();
-  try {
-    token = decodeURIComponent(token);
-  } catch {
-    // Keep the raw value.
-  }
-  return token.split(".")[0] || null;
+  const token = value.slice(7).trim();
+  if (!token) return null;
+  // `bearer()` decodes a signed token that has `%` and takes an unsigned one as it is.
+  const decoded = token.includes(".") && token.includes("%") ? tryDecode(token) : token;
+  return decoded.split(".")[0] || null;
 }
 
-/** A copy of `headers` with every `name` pair removed from `Cookie`. */
-function withoutCookie(headers: Headers | undefined, name: string): Headers {
+function tryDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** The names in the `Cookie` header. */
+function cookieNames(headers: Headers | undefined): string[] {
+  return (headers?.get("cookie") ?? "")
+    .split(";")
+    .map((pair) => pair.slice(0, Math.max(0, pair.indexOf("="))).trim())
+    .filter(Boolean);
+}
+
+/** A copy of `headers` with every pair named in `names` removed from `Cookie`. */
+function withoutCookies(headers: Headers | undefined, names: Set<string>): Headers {
   const copy = new Headers(headers);
   const kept = (copy.get("cookie") ?? "")
     .split(";")
     .map((pair) => pair.trim())
-    .filter((pair) => pair && pair.slice(0, Math.max(0, pair.indexOf("="))).trim() !== name);
+    .filter((pair) => pair && !names.has(pair.slice(0, Math.max(0, pair.indexOf("="))).trim()));
   copy.set("cookie", kept.join("; "));
   return copy;
 }

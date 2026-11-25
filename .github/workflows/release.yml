@@ -10,6 +10,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # Waits for a required reviewer, and only `v*` tags may deploy to it. npm's trusted
+    # publisher is bound to this environment (`npm trust ... --env npm-publish`).
+    environment: npm-publish
     permissions:
       # Creates the GitHub release.
       contents: write
@@ -23,7 +26,8 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          cache: pnpm
+          # No dependency cache: this job holds `id-token: write`.
+          package-manager-cache: false
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
       - name: Check the tag matches package.json
@@ -39,7 +43,18 @@ jobs:
       - run: pnpm test
       - run: pnpm build
       - run: pnpm check:package
+      - name: Check whether this version is already on npm
+        id: npm
+        run: |
+          name="$(node -p 'require("./package.json").name')"
+          version="$(node -p 'require("./package.json").version')"
+          # Prints nothing for a version that does not exist, and fails for a new package.
+          if [ "$(npm view "$name@$version" version 2>/dev/null)" = "$version" ]; then
+            echo "::notice::$name@$version is already on npm. Skipping publish."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish to npm
+        if: steps.npm.outputs.published != 'true'
         run: |
           case "$GITHUB_REF_NAME" in
             *-*) npm publish --provenance --access public --tag next ;;

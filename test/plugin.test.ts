@@ -1,6 +1,6 @@
 import type { BetterAuthPlugin } from "better-auth";
 import { createAuthEndpoint, dispatchAuthEndpoint, sessionMiddleware } from "better-auth/api";
-import { bearer, openAPI } from "better-auth/plugins";
+import { bearer, multiSession, openAPI } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 import packageJson from "../package.json" with { type: "json" };
 import { dbscClient } from "../src/client.ts";
@@ -498,6 +498,140 @@ describe("enforcement", () => {
   });
 });
 
+const SESSION_COOKIE = "better-auth.session_token";
+
+/** The signed session token in a jar, as `bearer()` hands it out in `set-auth-token`. */
+const tokenOf = (browser: Browser) => decodeURIComponent(browser.cookies.get(SESSION_COOKIE)!);
+const multiCookieOf = (browser: Browser) =>
+  [...browser.cookies].find(([name]) => name.startsWith(`${SESSION_COOKIE}_multi-`))!;
+
+// Better Auth merges before hooks in order and the last `cookie` written wins, so every
+// carrier is tested with dbsc() both before and after the plugin that reads it.
+for (const dbscLast of [false, true]) {
+  describe(`other session carriers, dbsc() ${dbscLast ? "after" : "before"} the others`, () => {
+    const withBearer = () => createTestAuth({}, { plugins: [bearer()] }, { dbscLast });
+    const withMultiSession = (plugins: BetterAuthPlugin[] = []) =>
+      createTestAuth({}, { plugins: [multiSession(), ...plugins] }, { dbscLast });
+
+    it("refuses a stolen cookie sent again as a bearer token", async () => {
+      const { auth } = await withBearer();
+      const { browser: owner } = await signUpAndBind(auth);
+      const thief = new Browser(auth);
+      thief.cookies.set(SESSION_COOKIE, owner.cookies.get(SESSION_COOKIE)!);
+      const headers = { authorization: `Bearer ${tokenOf(owner)}` };
+      expect((await thief.fetch("/get-session", { headers })).status).toBe(401);
+      expect((await thief.fetch("/list-sessions", { headers })).status).toBe(401);
+      expect(await owner.getSession()).not.toBeNull();
+    });
+
+    it("refuses a stolen bearer token next to the thief's own session cookie", async () => {
+      const { auth } = await withBearer();
+      const { browser: owner } = await signUpAndBind(auth);
+      const thief = new Browser(auth);
+      await thief.signUp();
+      for (const token of [tokenOf(owner), tokenOf(owner).split(".")[0]!]) {
+        const headers = { authorization: `Bearer ${token}` };
+        expect((await thief.fetch("/get-session", { headers })).status).toBe(401);
+        expect((await thief.fetch("/list-sessions", { headers })).status).toBe(401);
+      }
+    });
+
+    it("refuses a stolen bearer token alone", async () => {
+      const { auth } = await withBearer();
+      const { browser: owner } = await signUpAndBind(auth);
+      const headers = { authorization: `Bearer ${tokenOf(owner)}` };
+      expect((await new Browser(auth).fetch("/get-session", { headers })).status).toBe(401);
+    });
+
+    it("lets the bound browser send its own session as a bearer token", async () => {
+      const { auth } = await withBearer();
+      const { browser } = await signUpAndBind(auth);
+      const headers = { authorization: `Bearer ${tokenOf(browser)}` };
+      const response = await browser.fetch("/get-session", { headers });
+      expect(response.status).toBe(200);
+      expect((await response.json()).session.token).toBe(tokenOf(browser).split(".")[0]);
+    });
+
+    it("refuses a bound browser that sends another session as a bearer token", async () => {
+      const { auth } = await withBearer();
+      const { browser } = await signUpAndBind(auth);
+      const other = new Browser(auth);
+      await other.signUp();
+      const headers = { authorization: `Bearer ${tokenOf(other)}` };
+      expect((await browser.fetch("/get-session", { headers })).status).toBe(401);
+    });
+
+    it("ignores a bearer token that names no session, such as an OAuth access token", async () => {
+      // Without bearer(): with it, the endpoint itself reads such a token as signed out.
+      const { auth } = await createTestAuth({}, {}, { dbscLast });
+      const { browser } = await signUpAndBind(auth);
+      const headers = { authorization: "Bearer an-oauth-access-token" };
+      expect((await browser.fetch("/list-sessions", { headers })).status).toBe(200);
+    });
+
+    it("leaves unbound sessions alone over bearer", async () => {
+      const { auth } = await withBearer();
+      const plain = new Browser(auth);
+      await plain.signUp();
+      const headers = { authorization: `Bearer ${tokenOf(plain)}` };
+      const response = await new Browser(auth).fetch("/get-session", { headers });
+      expect(response.status).toBe(200);
+      expect(await response.json()).not.toBeNull();
+    });
+
+    it("does not leak a bound session through a copied multiSession() cookie", async () => {
+      const events: Record<string, unknown>[] = [];
+      const { auth } = await createTestAuth(
+        { onEvent: (event) => void events.push(event) },
+        { plugins: [multiSession()] },
+        { dbscLast },
+      );
+      const { browser: owner } = await signUpAndBind(auth);
+      const [name, value] = multiCookieOf(owner);
+      const ownerSession = await owner.getSession();
+      const thief = new Browser(auth);
+      await thief.signUp();
+      thief.cookies.set(name, value);
+
+      const list = await thief.fetch("/multi-session/list-device-sessions");
+      expect(list.status).toBe(200);
+      const listed = (await list.json()) as { session: { id: string } }[];
+      expect(listed.map(({ session }) => session.id)).not.toContain(ownerSession!.session.id);
+      const sessionToken = tokenOf(owner).split(".")[0]!;
+      expect((await thief.post("/multi-session/set-active", { sessionToken })).status).toBe(401);
+      expect((await thief.post("/multi-session/revoke", { sessionToken })).status).toBe(401);
+      expect((await thief.getSession())?.user.id).not.toBe(ownerSession!.user.id);
+      expect(await owner.getSession()).not.toBeNull();
+      expect(events).toContainEqual({
+        type: "credential_missing",
+        sessionId: ownerSession!.session.id,
+        userId: ownerSession!.user.id,
+        via: "multi-session",
+      });
+    });
+
+    it("refuses a copied multiSession() cookie sent with a bearer token", async () => {
+      const { auth } = await withMultiSession([bearer()]);
+      const { browser: owner } = await signUpAndBind(auth);
+      const thief = new Browser(auth);
+      await thief.signUp();
+      thief.cookies.set(...multiCookieOf(owner));
+      const headers = { authorization: `Bearer ${tokenOf(thief)}` };
+      const list = await thief.fetch("/multi-session/list-device-sessions", { headers });
+      expect(list.status).toBe(401);
+    });
+
+    it("keeps multiSession() working for the bound browser", async () => {
+      const { auth } = await withMultiSession();
+      const { browser } = await signUpAndBind(auth);
+      const list = await browser.fetch("/multi-session/list-device-sessions");
+      expect(((await list.json()) as unknown[]).length).toBe(1);
+      const sessionToken = tokenOf(browser).split(".")[0]!;
+      expect((await browser.post("/multi-session/set-active", { sessionToken })).status).toBe(200);
+    });
+  });
+}
+
 describe("enabled", () => {
   it("does nothing while off, and enforces again once back on", async () => {
     let on = true;
@@ -748,6 +882,32 @@ describe("freshProof unbound policies", () => {
     expect(stale.status).toBe(403);
     expect((await stale.json()).code).toBe("SESSION_NOT_FRESH");
   });
+
+  it("checks both the cookie and the bearer session, whichever the endpoint reads", async () => {
+    const { auth, database } = await createTestAuth(
+      { freshProof: { paths: ["/update-user"], unbound: "fresh-session" } },
+      { session: { freshAge: 60 }, plugins: [bearer()] },
+    );
+    const stale = new Browser(auth);
+    await stale.signUp();
+    const staleToken = decodeURIComponent(stale.cookies.get("better-auth.session_token")!);
+    database
+      .prepare('update "session" set "createdAt" = ? where "token" = ?')
+      .run(new Date(Date.now() - 3_600_000).toISOString(), staleToken.split(".")[0]!);
+    const fresh = new Browser(auth);
+    await fresh.signUp();
+    const response = await fresh.fetch("/update-user", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        origin: ORIGIN,
+        authorization: `Bearer ${staleToken}`,
+      },
+      body: JSON.stringify({ name: "x" }),
+    });
+    expect(response.status).toBe(403);
+    expect((await response.json()).code).toBe("SESSION_NOT_FRESH");
+  });
 });
 
 describe("onEvent", () => {
@@ -887,7 +1047,7 @@ describe("better auth conventions", () => {
     expect(client.$ERROR_CODES).toBe(DBSC_ERROR_CODES);
     expect(DBSC_ERROR_CODES.DBSC_CREDENTIAL_REQUIRED).toMatchObject({
       code: "DBSC_CREDENTIAL_REQUIRED",
-      message: "This session is bound to a device and cannot be used as a bearer token",
+      message: "This request carries a device-bound session without its device credential",
     });
   });
 

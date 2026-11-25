@@ -11,7 +11,7 @@ export const DBSC_ERROR_CODES = defineErrorCodes({
   DBSC_SESSION_ID_REQUIRED: "A DBSC refresh needs a `Sec-Secure-Session-Id` header",
   DBSC_CHALLENGE_REQUIRED: "Sign the new DBSC challenge and retry",
   DBSC_CREDENTIAL_REQUIRED:
-    "This session is bound to a device and cannot be used as a bearer token",
+    "This request carries a device-bound session without its device credential",
   DBSC_FRESH_PROOF_REQUIRED: "Confirm this device and try again",
   DBSC_BINDING_REQUIRED: "This action needs a device-bound session",
 });
