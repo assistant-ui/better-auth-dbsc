@@ -203,6 +203,24 @@ describe("verifyRegistrationProof", () => {
 });
 
 describe("verifyRefreshProof", () => {
+  it.each([
+    ["unknown algorithm", { alg: "unknown" }, "UNSUPPORTED_ALGORITHM"],
+    ["missing key", null, "UNSUPPORTED_ALGORITHM"],
+    [
+      "undersized RSA modulus",
+      { alg: "RS256", kty: "RSA", n: "AQ", e: "AQAB" },
+      "INVALID_PUBLIC_KEY",
+    ],
+    ["wrong curve", { alg: "ES256", kty: "EC", crv: "P-384" }, "INVALID_PUBLIC_KEY"],
+  ] as const)(
+    "rejects a stored key with %s before signature verification",
+    async (_name, stored, code) => {
+      const jwt = `${b64url({ alg: stored?.alg ?? "ES256" })}.${b64url({ jti: "c" })}.unused`;
+      const publicKey = JSON.parse(JSON.stringify(stored));
+      expect(await codeOf(verifyRefreshProof(jwt, { challenge: "c", publicKey }))).toBe(code);
+    },
+  );
+
   it("verifies against the stored key and ignores an embedded one", async () => {
     const device = await Device.create();
     const thief = await Device.create();
