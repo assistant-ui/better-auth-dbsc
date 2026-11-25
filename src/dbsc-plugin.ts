@@ -114,7 +114,7 @@ export type DbscEvent =
   | { type: "terminated"; reason: "disabled" | "no_session" | "not_bound" | "other_identifier" };
 
 /** Where a request carries a session token: see `dbsc()`'s gate. */
-export type DbscCarrier = "cookie" | "bearer" | "multi-session";
+export type DbscCarrier = "cookie" | "bearer" | "multi-session" | "admin-session";
 
 type HookContext = Parameters<Parameters<typeof createAuthMiddleware>[0]>[0];
 type AuthContext = HookContext["context"];
@@ -165,11 +165,12 @@ export interface DbscOptions {
   };
   /**
    * What happens to a bound session that arrives without a live bound cookie: its session
-   * cookie (and any `multiSession()` cookie naming it) is dropped from the request, as if
-   * absent. Every endpoint then behaves as signed out, `getSession` answers `null`, and the
-   * session itself is untouched, so a copied cookie can never sign the owner out. A request
-   * with `Authorization: Bearer` that carries a bound session is refused with 401 unless
-   * the bound cookie proves it and the bearer token names that same session.
+   * cookie (and any `multiSession()` or `admin_session` cookie naming it) is dropped from
+   * the request, as if absent. Every endpoint then behaves as signed out, `getSession`
+   * answers `null`, and the session itself is untouched, so a copied cookie can never sign
+   * the owner out. A request with `Authorization: Bearer` that carries a bound session is
+   * refused with 401 unless the bound cookie proves it and the bearer token names that same
+   * session.
    */
   enforcement?: {
     /**
@@ -524,9 +525,9 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
    * Checks every session token the request carries, not only the one the endpoint will
    * read: the session cookie, `Authorization: Bearer` (the `bearer()` plugin turns it into
    * the session cookie in its own before hook, which may run after this one and rebuilds
-   * the cookie header from the original request), and `multiSession()`'s per-session
-   * cookies. A bound session that the bound cookie does not prove must not reach any
-   * endpoint by any of them.
+   * the cookie header from the original request), `multiSession()`'s per-session cookies,
+   * and `admin()`'s `admin_session` cookie while impersonating. A bound session that the
+   * bound cookie does not prove must not reach any endpoint by any of them.
    *
    * - With a bearer token, dropping cookies cannot work, because `bearer()` may write the
    *   cookie header after this hook. So a request that carries a bound session is refused
@@ -553,6 +554,13 @@ export const dbsc = <O extends DbscOptions>(options?: O) => {
       if (typeof token === "string" && token)
         carried.push({ via: "multi-session", token, cookie: name });
     }
+    // While an admin impersonates someone, `admin()` keeps the admin's own session token
+    // in this signed cookie as `<token>:<dont remember>`, and `/admin/stop-impersonating`
+    // swaps it back in as the session cookie.
+    const adminCookie = ctx.context.createAuthCookie("admin_session").name;
+    const adminValue = await ctx.getSignedCookie(adminCookie, ctx.context.secret);
+    const adminToken = typeof adminValue === "string" ? adminValue.split(":")[0] : undefined;
+    if (adminToken) carried.push({ via: "admin-session", token: adminToken, cookie: adminCookie });
 
     const states = new Map<string, Promise<SessionState>>();
     const stateOf = (token: string | null) => {
