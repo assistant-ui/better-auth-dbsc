@@ -1,6 +1,6 @@
 {
   "name": "@assistant-ui/better-auth-dbsc",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Device Bound Session Credentials (DBSC) for Better Auth.",
   "keywords": [
     "better-auth",
