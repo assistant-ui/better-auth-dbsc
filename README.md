@@ -236,7 +236,7 @@ dbsc({
 
 | `type` | When |
 |---|---|
-| `registered` | A session was bound. |
+| `registered` | The request created a session binding. Concurrent retries with the same key share that binding and emit one event. |
 | `registration_refused` | With a `reason`: `invalid_challenge`, `invalid_proof`, `bound_to_other_key`, or `disabled`. |
 | `refreshed` | A bound cookie was renewed. |
 | `refresh_challenged` | With a `reason`: `missing_proof` (normal), `stale_challenge`, or `replayed`. |
