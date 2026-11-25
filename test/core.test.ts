@@ -79,6 +79,17 @@ describe("verifyRegistrationProof", () => {
     );
   });
 
+  it("measures RSA modulus strength by significant bits", () => {
+    for (const firstByte of [0, 127]) {
+      const bytes = new Uint8Array(256).fill(255);
+      bytes[0] = firstByte;
+      const n = Buffer.from(bytes).toString("base64url");
+      expect(
+        parseStoredPublicKey(JSON.stringify({ kty: "RSA", alg: "RS256", n, e: "AQAB" })),
+      ).toBeNull();
+    }
+  });
+
   it("rejects RSA keys under 2048 bits", async () => {
     // jose will not generate a weak key, so use WebCrypto. The key size is checked
     // before the signature, so the signature can be anything.
