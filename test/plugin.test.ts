@@ -502,6 +502,19 @@ describe("enforcement", () => {
     ).toBeNull();
   });
 
+  it("observes server-side revocation while the session cookie cache is warm", async () => {
+    const { auth } = await createTestAuth({}, { session: { cookieCache: { enabled: true } } });
+    const { browser } = await signUpAndBind(auth);
+    const session = await browser.getSession();
+    expect(session).not.toBeNull();
+    expect([...browser.cookies.keys()].some((name) => name.endsWith("session_data"))).toBe(true);
+    const { internalAdapter } = await auth.$context;
+    await internalAdapter.deleteSession(String(session!.session.token));
+    expect(
+      await auth.api.getSession({ headers: new Headers({ cookie: browser.cookieHeader }) }),
+    ).toBeNull();
+  });
+
   it("does not answer from session.cookieCache for a copied cookie", async () => {
     const { auth } = await createTestAuth(
       {},
@@ -569,6 +582,32 @@ const SESSION_COOKIE = "better-auth.session_token";
 const tokenOf = (browser: Browser) => decodeURIComponent(browser.cookies.get(SESSION_COOKIE)!);
 const multiCookieOf = (browser: Browser) =>
   [...browser.cookies].find(([name]) => name.startsWith(`${SESSION_COOKIE}_multi-`))!;
+
+describe("DBSC helper authentication", () => {
+  it.each([
+    ["disabled", [], false],
+    ["signature required", [bearer({ requireSignature: true })], false],
+    ["enabled before DBSC", [bearer()], true],
+    ["enabled after DBSC", [bearer()], false],
+  ] as const)(
+    "follows Better Auth bearer authentication when %s",
+    async (_name, plugins, dbscLast) => {
+      const { auth } = await createTestAuth({}, { plugins: [...plugins] }, { dbscLast });
+      const plain = new Browser(auth);
+      await plain.signUp();
+      const signed = tokenOf(plain);
+      for (const token of [signed, signed.split(".")[0]!]) {
+        const headers = new Headers({ authorization: `Bearer ${token}` });
+        const session = await auth.api.getSession({ headers });
+        const expected = session ? "unbound" : "no-session";
+        expect((await auth.api.getDbscStatus({ headers })).state).toBe(expected);
+        expect(
+          (await auth.api.requireFreshProof({ headers, body: { action: "export" } })).state,
+        ).toBe(expected);
+      }
+    },
+  );
+});
 
 // Better Auth merges before hooks in order and the last `cookie` written wins, so every
 // carrier is tested with dbsc() both before and after the plugin that reads it.
